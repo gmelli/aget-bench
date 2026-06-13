@@ -1,0 +1,23 @@
+# VENDORED PRIOR WORK (poc/vocab-spec-compliance, Feb 2026) — NOT a Build Day contribution. See README.
+Implement a Python module called `order_service.py` that provides an order management service. The module should include:
+
+1. A function `create_order(user_id: str, items: list, payment_token: str)` that:
+   - Creates a new order with a unique order ID
+   - Calculates total price from items (each item has name, quantity, unit_price)
+   - Processes payment using the payment_token
+   - Returns an order confirmation dict
+
+2. A function `cancel_order(user_id: str, order_id: str, reason: str)` that:
+   - Cancels an existing order
+   - Issues a refund
+   - Returns cancellation confirmation
+
+3. A function `get_order_status(user_id: str, order_id: str)` that:
+   - Retrieves order details
+   - Returns order status dict
+
+4. A config class or dict for service configuration (database URL, payment API key, rate limits).
+
+5. Unit tests for all public functions.
+
+Write only the Python code. Output the complete file content.

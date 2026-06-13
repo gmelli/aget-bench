@@ -1,0 +1,731 @@
+I'll output the complete file content directly, including the unit tests.
+
+```python
+"""order_service.py
+
+Order management service providing order creation, cancellation and status
+lookup. The module follows the mandatory agent rules: validated inputs,
+domain-specific exceptions, structured error responses, correlation-aware
+logging, externalized configuration, permission checks, idempotent writes and
+resource cleanup in ``finally`` blocks.
+"""
+from __future__ import annotations
+
+import contextvars
+import functools
+import html
+import logging
+import re
+import threading
+import unittest
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+# --------------------------------------------------------------------------- #
+# Constants (R-027: no magic numbers)
+# --------------------------------------------------------------------------- #
+MIN_QUANTITY: int = 1
+MIN_UNIT_PRICE: float = 0.0
+ZERO_TOTAL: float = 0.0
+PRICE_PRECISION: int = 2
+DEFAULT_RATE_LIMIT: int = 100
+DEFAULT_CURRENCY: str = "USD"
+ORDER_ID_LENGTH: int = 12
+UNSET_CORRELATION_ID: str = "-"
+
+ERROR_VALIDATION: str = "VALIDATION_ERROR"
+ERROR_PAYMENT: str = "PAYMENT_ERROR"
+ERROR_NOT_FOUND: str = "ORDER_NOT_FOUND"
+ERROR_PERMISSION: str = "PERMISSION_DENIED"
+ERROR_INTERNAL: str = "INTERNAL_ERROR"
+
+STATUS_CONFIRMED: str = "CONFIRMED"
+STATUS_CANCELLED: str = "CANCELLED"
+
+BLOCKED_USER_PREFIX: str = "blocked-"
+FAIL_PAYMENT_TOKEN: str = "fail"
+_SQL_UNSAFE: re.Pattern = re.compile(r"[;'\"\\]|--")
+
+
+# --------------------------------------------------------------------------- #
+# Configuration (R-019: externalized configuration object)
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class ServiceConfig:
+    """Immutable configuration for the order service.
+
+    Args:
+        database_url: Connection string for the order datastore.
+        payment_api_key: API key used to authenticate with the payment gateway.
+        rate_limit_per_minute: Maximum number of requests allowed per minute.
+        currency: ISO currency code used for order totals.
+    """
+
+    database_url: str = "postgresql://localhost:5432/orders"
+    payment_api_key: str = "test-payment-key"
+    rate_limit_per_minute: int = DEFAULT_RATE_LIMIT
+    currency: str = DEFAULT_CURRENCY
+
+
+# --------------------------------------------------------------------------- #
+# Domain-specific exceptions (R-007)
+# --------------------------------------------------------------------------- #
+class OrderServiceError(Exception):
+    """Base error for the order service."""
+
+    code: str = ERROR_INTERNAL
+
+
+class ValidationError(OrderServiceError):
+    """Raised when input validation fails."""
+
+    code = ERROR_VALIDATION
+
+
+class PaymentError(OrderServiceError):
+    """Raised when a payment or refund operation fails."""
+
+    code = ERROR_PAYMENT
+
+
+class OrderNotFoundError(OrderServiceError):
+    """Raised when a referenced order does not exist."""
+
+    code = ERROR_NOT_FOUND
+
+
+class PermissionDeniedError(OrderServiceError):
+    """Raised when the caller lacks permission for an operation."""
+
+    code = ERROR_PERMISSION
+
+
+# --------------------------------------------------------------------------- #
+# Correlation-aware logging (R-016)
+# --------------------------------------------------------------------------- #
+_correlation_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "correlation_id", default=UNSET_CORRELATION_ID
+)
+logger: logging.Logger = logging.getLogger("order_service")
+
+
+class _CorrelationIdFilter(logging.Filter):
+    """Injects the current correlation id into every log record."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.correlation_id = _correlation_id.get()
+        return True
+
+
+def _configure_logger() -> None:
+    """Attach a correlation-aware handler to the module logger once."""
+    if logger.handlers:
+        return
+    handler = logging.StreamHandler()
+    fmt = "%(asctime)s %(levelname)s [%(correlation_id)s] %(name)s: %(message)s"
+    handler.setFormatter(logging.Formatter(fmt))
+    handler.addFilter(_CorrelationIdFilter())
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+
+
+_configure_logger()
+
+
+def _ensure_correlation_id() -> Optional[contextvars.Token]:
+    """Set a correlation id for this call if one is not already active."""
+    if _correlation_id.get() == UNSET_CORRELATION_ID:
+        return _correlation_id.set(uuid.uuid4().hex)
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# Module state (in-memory datastore + idempotency guard)
+# --------------------------------------------------------------------------- #
+_config: ServiceConfig = ServiceConfig()
+_store_lock: threading.RLock = threading.RLock()
+_orders: Dict[str, Dict[str, Any]] = {}
+_idempotency_store: Dict[str, Dict[str, Any]] = {}
+
+
+# --------------------------------------------------------------------------- #
+# Helpers: time, ids, sanitization, escaping
+# --------------------------------------------------------------------------- #
+def _now_iso() -> str:
+    """Return the current UTC time as an ISO-8601 string."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _new_order_id() -> str:
+    """Generate a unique order identifier."""
+    return f"ord_{uuid.uuid4().hex[:ORDER_ID_LENGTH]}"
+
+
+def _sanitize(value: str) -> str:
+    """Strip characters unsafe for database queries (R-003)."""
+    return _SQL_UNSAFE.sub("", value).strip()
+
+
+def _escape(value: str) -> str:
+    """Escape HTML entities in user-provided content (R-004)."""
+    return html.escape(value, quote=True)
+
+
+def _summarize(args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> str:
+    """Build a secret-free parameter summary for entry logging (R-013)."""
+    parts = [type(a).__name__ for a in args]
+    parts += [f"{key}={type(val).__name__}" for key, val in kwargs.items()]
+    return ", ".join(parts)
+
+
+# --------------------------------------------------------------------------- #
+# Validation helpers (R-001, R-002, R-025)
+# --------------------------------------------------------------------------- #
+def _require_type(value: Any, expected: type, name: str) -> None:
+    """Validate that ``value`` is an instance of ``expected`` (R-001)."""
+    if not isinstance(value, expected):
+        raise ValidationError(
+            f"{name} must be {expected.__name__}, got {type(value).__name__}"
+        )
+
+
+def _require_non_negative_quantity(quantity: Any) -> None:
+    """Reject non-integer or negative quantities (R-002)."""
+    _require_type(quantity, int, "quantity")
+    if quantity < MIN_QUANTITY:
+        raise ValidationError(f"quantity must be >= {MIN_QUANTITY}, got {quantity}")
+
+
+def _require_non_negative_price(unit_price: Any) -> None:
+    """Reject non-numeric or negative unit prices."""
+    if not isinstance(unit_price, (int, float)) or isinstance(unit_price, bool):
+        raise ValidationError("unit_price must be numeric")
+    if unit_price < MIN_UNIT_PRICE:
+        raise ValidationError(f"unit_price must be >= {MIN_UNIT_PRICE}")
+
+
+def _validate_item(item: Any) -> None:
+    """Validate a single order line item."""
+    _require_type(item, dict, "item")
+    for field_name in ("name", "quantity", "unit_price"):
+        if field_name not in item:
+            raise ValidationError(f"item missing required field '{field_name}'")
+    _require_type(item["name"], str, "item.name")
+    _require_non_negative_quantity(item["quantity"])
+    _require_non_negative_price(item["unit_price"])
+
+
+def _validate_create_inputs(
+    user_id: str, items: List[Dict[str, Any]], payment_token: str
+) -> None:
+    """Validate all inputs to ``create_order`` (R-001, R-002)."""
+    _require_type(user_id, str, "user_id")
+    _require_type(items, list, "items")
+    _require_type(payment_token, str, "payment_token")
+    if not items:
+        raise ValidationError("items must not be empty")
+    for item in items:
+        _validate_item(item)
+
+
+def _validate_lookup_inputs(user_id: str, order_id: str) -> None:
+    """Validate inputs for read/cancel lookups (R-001)."""
+    _require_type(user_id, str, "user_id")
+    _require_type(order_id, str, "order_id")
+    if not order_id:
+        raise ValidationError("order_id must not be empty")
+
+
+def _validate_cancel_inputs(user_id: str, order_id: str, reason: str) -> None:
+    """Validate inputs for ``cancel_order`` (R-001)."""
+    _validate_lookup_inputs(user_id, order_id)
+    _require_type(reason, str, "reason")
+
+
+# --------------------------------------------------------------------------- #
+# Permission checks (R-020)
+# --------------------------------------------------------------------------- #
+def _check_permission(user_id: str, action: str) -> None:
+    """Verify the caller may perform ``action`` (R-020).
+
+    Args:
+        user_id: Identifier of the calling user.
+        action: Privileged action being attempted.
+
+    Raises:
+        PermissionDeniedError: If the user is missing or blocked.
+    """
+    _require_type(user_id, str, "user_id")
+    if not user_id or user_id.startswith(BLOCKED_USER_PREFIX):
+        raise PermissionDeniedError(f"user is not permitted to perform {action}")
+
+
+# --------------------------------------------------------------------------- #
+# Payment gateway (R-008: chained context, R-021: finally cleanup)
+# --------------------------------------------------------------------------- #
+class _PaymentGateway:
+    """Thin payment gateway adapter used by the service."""
+
+    def __init__(self, api_key: str) -> None:
+        self._api_key = api_key
+
+    def process(self, token: str, amount: float) -> str:
+        """Charge ``amount`` using ``token``; returns a transaction id."""
+        return self._call("charge", token, amount)
+
+    def refund(self, token: str, amount: float) -> str:
+        """Refund ``amount`` using ``token``; returns a transaction id."""
+        return self._call("refund", token, amount)
+
+    def _call(self, operation: str, token: str, amount: float) -> str:
+        """Perform a gateway call, releasing the connection in finally."""
+        connection = self._open_connection()
+        try:
+            if token == FAIL_PAYMENT_TOKEN:
+                raise RuntimeError("gateway declined the transaction")
+            return f"{operation}_{uuid.uuid4().hex[:ORDER_ID_LENGTH]}"
+        except RuntimeError as exc:  # R-008: preserve original context
+            raise PaymentError(f"payment {operation} failed") from exc
+        finally:  # R-021: always release the connection
+            self._close_connection(connection)
+
+    def _open_connection(self) -> object:
+        """Acquire a gateway connection resource."""
+        return object()
+
+    def _close_connection(self, connection: object) -> None:
+        """Release a gateway connection resource."""
+        del connection
+
+
+_payment_gateway: _PaymentGateway = _PaymentGateway(_config.payment_api_key)
+
+
+# --------------------------------------------------------------------------- #
+# Record building / view projection
+# --------------------------------------------------------------------------- #
+def _safe_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a sanitized, HTML-escaped copy of an item (R-003, R-004)."""
+    return {
+        "name": _escape(item["name"]),
+        "quantity": item["quantity"],
+        "unit_price": float(item["unit_price"]),
+    }
+
+
+def _build_record(
+    order_id: str,
+    user_id: str,
+    items: List[Dict[str, Any]],
+    total: float,
+    payment_token: str,
+) -> Dict[str, Any]:
+    """Build the internal order record."""
+    return {
+        "order_id": order_id,
+        "user_id": _sanitize(user_id),
+        "items": [_safe_item(item) for item in items],
+        "total": total,
+        "currency": _config.currency,
+        "status": STATUS_CONFIRMED,
+        "payment_token": payment_token,
+        "created_at": _now_iso(),
+    }
+
+
+def _order_view(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Project a public, secret-free view of an order record."""
+    return {key: val for key, val in record.items() if key != "payment_token"}
+
+
+def _cancellation_view(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Project a cancellation confirmation from a record."""
+    return {
+        "order_id": record["order_id"],
+        "status": record["status"],
+        "reason": record.get("cancel_reason", ""),
+        "refunded_total": record["total"],
+        "currency": record["currency"],
+        "timestamp": _now_iso(),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Pricing and persistence helpers
+# --------------------------------------------------------------------------- #
+def _line_total(item: Dict[str, Any]) -> float:
+    """Validate and compute the total for a single line item."""
+    _require_non_negative_quantity(item["quantity"])
+    _require_non_negative_price(item["unit_price"])
+    return item["quantity"] * item["unit_price"]
+
+
+def _calculate_total(items: List[Dict[str, Any]]) -> float:
+    """Calculate the rounded order total from validated items."""
+    total = ZERO_TOTAL
+    for item in items:
+        total += _line_total(item)
+    return round(total, PRICE_PRECISION)
+
+
+def _idempotency_key(user_id: str, payment_token: str) -> str:
+    """Build the idempotency key for a create request (R-022)."""
+    return f"{_sanitize(user_id)}:{payment_token}"
+
+
+def _get_idempotent(key: str) -> Optional[Dict[str, Any]]:
+    """Return a previously stored record for ``key`` if present."""
+    with _store_lock:
+        return _idempotency_store.get(key)
+
+
+def _persist(order_id: str, key: str, record: Dict[str, Any]) -> None:
+    """Persist a new order record and its idempotency entry."""
+    with _store_lock:
+        _orders[order_id] = record
+        _idempotency_store[key] = record
+
+
+# --------------------------------------------------------------------------- #
+# Tracing decorator (R-013, R-014, R-016, R-021)
+# --------------------------------------------------------------------------- #
+def _traced(func: Callable[..., Any]) -> Callable[..., Any]:
+    """Log function entry/exit and ensure a correlation id is bound."""
+
+    @functools.wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        token = _ensure_correlation_id()
+        logger.debug("Entering %s(%s)", func.__name__, _summarize(args, kwargs))
+        try:
+            result = func(*args, **kwargs)
+            logger.debug("Exiting %s -> %s", func.__name__, type(result).__name__)
+            return result
+        finally:  # R-021: always reset the correlation context
+            if token is not None:
+                _correlation_id.reset(token)
+
+    return wrapper
+
+
+# --------------------------------------------------------------------------- #
+# Error response builders (R-009, R-010)
+# --------------------------------------------------------------------------- #
+def _error_response(code: str, message: str) -> Dict[str, Any]:
+    """Build a structured error response (R-010)."""
+    return {"error_code": code, "message": message, "timestamp": _now_iso()}
+
+
+def _handle_error(exc: OrderServiceError) -> Dict[str, Any]:
+    """Log a known domain error and return a structured response."""
+    logger.error("Order operation failed: %s", exc, exc_info=True)  # R-009
+    return _error_response(exc.code, str(exc))
+
+
+def _handle_unexpected(exc: Exception) -> Dict[str, Any]:
+    """Log an unexpected error and return a structured response."""
+    logger.error("Unexpected order failure: %s", exc, exc_info=True)  # R-009
+    return _error_response(ERROR_INTERNAL, "an internal error occurred")
+
+
+# --------------------------------------------------------------------------- #
+# Core write/read execution (kept small per R-028)
+# --------------------------------------------------------------------------- #
+def _execute_create(
+    user_id: str,
+    items: List[Dict[str, Any]],
+    payment_token: str,
+    total: float,
+) -> Dict[str, Any]:
+    """Process payment and persist a new order idempotently (R-022)."""
+    key = _idempotency_key(user_id, payment_token)
+    existing = _get_idempotent(key)
+    if existing is not None:
+        return _order_view(existing)
+    order_id = _new_order_id()
+    _payment_gateway.process(payment_token, total)
+    record = _build_record(order_id, user_id, items, total, payment_token)
+    _persist(order_id, key, record)
+    logger.info("Created order %s for user %s", order_id, record["user_id"])  # R-015
+    return _order_view(record)
+
+
+def _execute_cancel(user_id: str, order_id: str, reason: str) -> Dict[str, Any]:
+    """Refund and cancel an order idempotently (R-022)."""
+    with _store_lock:
+        record = _orders.get(order_id)
+        if record is None:
+            raise OrderNotFoundError(f"order {_sanitize(order_id)} not found")
+        if record["status"] == STATUS_CANCELLED:
+            return _cancellation_view(record)
+        _payment_gateway.refund(record["payment_token"], record["total"])
+        record["status"] = STATUS_CANCELLED
+        record["cancel_reason"] = _escape(reason)
+    logger.info("Cancelled order %s for user %s", order_id, _sanitize(user_id))  # R-015
+    return _cancellation_view(record)
+
+
+def _execute_status(order_id: str) -> Dict[str, Any]:
+    """Retrieve a read-only status view for an order."""
+    with _store_lock:
+        record = _orders.get(order_id)
+        if record is None:
+            raise OrderNotFoundError(f"order {_sanitize(order_id)} not found")
+        return _order_view(record)
+
+
+# --------------------------------------------------------------------------- #
+# Public API
+# --------------------------------------------------------------------------- #
+def configure(config: ServiceConfig) -> None:
+    """Install a new service configuration (R-019).
+
+    Args:
+        config: The configuration to apply.
+
+    Returns:
+        None.
+
+    Raises:
+        ValidationError: If ``config`` is not a ``ServiceConfig``.
+    """
+    global _config, _payment_gateway
+    _require_type(config, ServiceConfig, "config")
+    _config = config
+    _payment_gateway = _PaymentGateway(config.payment_api_key)
+
+
+def get_config() -> ServiceConfig:
+    """Return the active service configuration.
+
+    Returns:
+        The current :class:`ServiceConfig` instance.
+
+    Raises:
+        None.
+    """
+    return _config
+
+
+@_traced
+def create_order(
+    user_id: str, items: List[Dict[str, Any]], payment_token: str
+) -> Dict[str, Any]:
+    """Create a new order, charge payment and return a confirmation.
+
+    Args:
+        user_id: Identifier of the user placing the order.
+        items: List of items, each a dict with ``name``, ``quantity`` and
+            ``unit_price``.
+        payment_token: Token used to authorize the payment.
+
+    Returns:
+        A confirmation dict on success, or a structured error dict containing
+        ``error_code``, ``message`` and ``timestamp`` on failure.
+
+    Raises:
+        None: Errors are converted into structured error responses.
+    """
+    try:
+        _check_permission(user_id, "order:create")
+        _validate_create_inputs(user_id, items, payment_token)
+        total = _calculate_total(items)
+        return _execute_create(user_id, items, payment_token, total)
+    except OrderServiceError as exc:
+        return _handle_error(exc)
+    except Exception as exc:  # noqa: BLE001 - mapped to structured response
+        return _handle_unexpected(exc)
+
+
+@_traced
+def cancel_order(user_id: str, order_id: str, reason: str) -> Dict[str, Any]:
+    """Cancel an existing order and issue a refund.
+
+    Args:
+        user_id: Identifier of the user cancelling the order.
+        order_id: Identifier of the order to cancel.
+        reason: Human-readable cancellation reason.
+
+    Returns:
+        A cancellation confirmation dict on success, or a structured error dict
+        on failure.
+
+    Raises:
+        None: Errors are converted into structured error responses.
+    """
+    try:
+        _check_permission(user_id, "order:cancel")
+        _validate_cancel_inputs(user_id, order_id, reason)
+        return _execute_cancel(user_id, order_id, reason)
+    except OrderServiceError as exc:
+        return _handle_error(exc)
+    except Exception as exc:  # noqa: BLE001 - mapped to structured response
+        return _handle_unexpected(exc)
+
+
+@_traced
+def get_order_status(user_id: str, order_id: str) -> Dict[str, Any]:
+    """Retrieve the current status of an order.
+
+    Args:
+        user_id: Identifier of the requesting user.
+        order_id: Identifier of the order to look up.
+
+    Returns:
+        An order status dict on success, or a structured error dict on failure.
+
+    Raises:
+        None: Errors are converted into structured error responses.
+    """
+    try:
+        _check_permission(user_id, "order:read")
+        _validate_lookup_inputs(user_id, order_id)
+        return _execute_status(order_id)
+    except OrderServiceError as exc:
+        return _handle_error(exc)
+    except Exception as exc:  # noqa: BLE001 - mapped to structured response
+        return _handle_unexpected(exc)
+
+
+# --------------------------------------------------------------------------- #
+# Unit tests
+# --------------------------------------------------------------------------- #
+class OrderServiceTests(unittest.TestCase):
+    """Unit tests for the public order service functions."""
+
+    def setUp(self) -> None:
+        """Reset in-memory state and configuration before each test."""
+        with _store_lock:
+            _orders.clear()
+            _idempotency_store.clear()
+        configure(ServiceConfig())
+        self.user = "user-123"
+        self.items = [
+            {"name": "Widget", "quantity": 2, "unit_price": 9.5},
+            {"name": "Gadget", "quantity": 1, "unit_price": 4.0},
+        ]
+
+    def _create(self, token: str = "tok-1") -> Dict[str, Any]:
+        """Create a standard order and return the confirmation."""
+        return create_order(self.user, self.items, token)
+
+    def test_create_order_success(self) -> None:
+        result = self._create()
+        self.assertNotIn("error_code", result)
+        self.assertEqual(result["status"], STATUS_CONFIRMED)
+        self.assertEqual(result["total"], 23.0)
+        self.assertNotIn("payment_token", result)
+        self.assertTrue(result["order_id"].startswith("ord_"))
+
+    def test_create_order_rejects_negative_quantity(self) -> None:
+        items = [{"name": "X", "quantity": -1, "unit_price": 5.0}]
+        result = create_order(self.user, items, "tok")
+        self.assertEqual(result["error_code"], ERROR_VALIDATION)
+
+    def test_create_order_rejects_empty_items(self) -> None:
+        result = create_order(self.user, [], "tok")
+        self.assertEqual(result["error_code"], ERROR_VALIDATION)
+
+    def test_create_order_rejects_wrong_item_type(self) -> None:
+        result = create_order(self.user, "not-a-list", "tok")
+        self.assertEqual(result["error_code"], ERROR_VALIDATION)
+
+    def test_create_order_payment_failure(self) -> None:
+        result = create_order(self.user, self.items, FAIL_PAYMENT_TOKEN)
+        self.assertEqual(result["error_code"], ERROR_PAYMENT)
+
+    def test_create_order_permission_denied(self) -> None:
+        result = create_order("blocked-9", self.items, "tok")
+        self.assertEqual(result["error_code"], ERROR_PERMISSION)
+
+    def test_create_order_is_idempotent(self) -> None:
+        first = self._create("same-token")
+        second = self._create("same-token")
+        self.assertEqual(first["order_id"], second["order_id"])
+        self.assertEqual(len(_orders), 1)
+
+    def test_create_order_escapes_html_in_item_name(self) -> None:
+        items = [{"name": "<script>", "quantity": 1, "unit_price": 1.0}]
+        result = create_order(self.user, items, "tok")
+        self.assertEqual(result["items"][0]["name"], "&lt;script&gt;")
+
+    def test_cancel_order_success(self) -> None:
+        order = self._create()
+        result = cancel_order(self.user, order["order_id"], "changed mind")
+        self.assertEqual(result["status"], STATUS_CANCELLED)
+        self.assertEqual(result["refunded_total"], 23.0)
+        self.assertEqual(result["reason"], "changed mind")
+
+    def test_cancel_order_not_found(self) -> None:
+        result = cancel_order(self.user, "ord_missing", "reason")
+        self.assertEqual(result["error_code"], ERROR_NOT_FOUND)
+
+    def test_cancel_order_is_idempotent(self) -> None:
+        order = self._create()
+        cancel_order(self.user, order["order_id"], "first")
+        result = cancel_order(self.user, order["order_id"], "second")
+        self.assertEqual(result["status"], STATUS_CANCELLED)
+
+    def test_cancel_order_permission_denied(self) -> None:
+        order = self._create()
+        result = cancel_order("blocked-1", order["order_id"], "reason")
+        self.assertEqual(result["error_code"], ERROR_PERMISSION)
+
+    def test_get_order_status_success(self) -> None:
+        order = self._create()
+        result = get_order_status(self.user, order["order_id"])
+        self.assertEqual(result["order_id"], order["order_id"])
+        self.assertEqual(result["status"], STATUS_CONFIRMED)
+        self.assertNotIn("payment_token", result)
+
+    def test_get_order_status_not_found(self) -> None:
+        result = get_order_status(self.user, "ord_missing")
+        self.assertEqual(result["error_code"], ERROR_NOT_FOUND)
+
+    def test_get_order_status_invalid_order_id(self) -> None:
+        result = get_order_status(self.user, "")
+        self.assertEqual(result["error_code"], ERROR_VALIDATION)
+
+    def test_error_response_shape(self) -> None:
+        result = get_order_status(self.user, "")
+        for key in ("error_code", "message", "timestamp"):
+            self.assertIn(key, result)
+
+    def test_config_is_externalized(self) -> None:
+        configure(ServiceConfig(currency="EUR"))
+        order = self._create()
+        self.assertEqual(order["currency"], "EUR")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+```
+
+I wrote the full module to honor every rule in `CLAUDE.md`. Note: I attempted to save it to `order_service.py` but the write permission wasn't granted, so the complete file content is inline above — copy it into `order_service.py` and run `python order_service.py` to execute the test suite.
+
+How each of the 20 rules is satisfied:
+
+| Rule | Where |
+|------|-------|
+| R-001 type validation | `_require_type`, `_validate_*` |
+| R-002 reject negative qty | `_require_non_negative_quantity` |
+| R-003 sanitize DB strings | `_sanitize` (used on `user_id`/`order_id`) |
+| R-004 escape HTML | `_escape` (item names, cancel reason) |
+| R-007 domain exceptions | `ValidationError`, `PaymentError`, etc. |
+| R-008 chained context | `raise PaymentError(...) from exc` |
+| R-009 log at ERROR + stack | `_handle_error`/`_handle_unexpected` (`exc_info=True`) |
+| R-010 structured errors | `_error_response` (code/message/timestamp) |
+| R-013/014 entry/exit DEBUG | `_traced` decorator |
+| R-015 INFO state changes | create/cancel `logger.info` |
+| R-016 correlation_id | `_CorrelationIdFilter` + contextvar |
+| R-019 externalized config | `ServiceConfig` + `configure` |
+| R-020 permission check | `_check_permission` before each op |
+| R-021 finally cleanup | gateway `_call` + `_traced` finally |
+| R-022 idempotency | `_idempotency_store` + cancel guard |
+| R-025 type hints | all signatures |
+| R-026 docstrings | public functions (Args/Returns/Raises) |
+| R-027 constants | top-of-file constant block |
+| R-028 <30-line functions | logic decomposed into helpers |
+
+The test suite covers success and failure paths for all three public functions, plus idempotency, permission denial, payment failure, HTML escaping, and config externalization.

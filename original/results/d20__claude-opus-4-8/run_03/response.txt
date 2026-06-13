@@ -1,0 +1,801 @@
+The file write needs permission, but your request was to **output the complete file content** — so here it is directly. Two files: the module and its tests.
+
+## `order_service.py`
+
+```python
+"""Order management service.
+
+This module provides a small, self-contained order management service with
+functions to create, cancel, and inspect orders. It follows the project's
+mandatory engineering rules: every public function validates its inputs,
+emits structured logs carrying a ``correlation_id``, raises domain-specific
+exceptions with preserved context, and returns structured payloads.
+
+The persistence and payment layers are intentionally abstracted behind small
+in-memory/gateway helpers so the orchestration logic stays testable.
+"""
+
+from __future__ import annotations
+
+import html
+import logging
+import re
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
+# --------------------------------------------------------------------------- #
+# Constants (R-027: no magic numbers)
+# --------------------------------------------------------------------------- #
+MIN_QUANTITY: int = 1
+MIN_UNIT_PRICE: float = 0.0
+PRICE_ROUNDING_DECIMALS: int = 2
+ORDER_ID_PREFIX: str = "ord"
+REFUND_ID_PREFIX: str = "ref"
+
+STATUS_CREATED: str = "CREATED"
+STATUS_CANCELLED: str = "CANCELLED"
+
+ERROR_VALIDATION: str = "VALIDATION_ERROR"
+ERROR_PERMISSION: str = "PERMISSION_DENIED"
+ERROR_NOT_FOUND: str = "ORDER_NOT_FOUND"
+ERROR_PAYMENT: str = "PAYMENT_FAILED"
+ERROR_INTERNAL: str = "INTERNAL_ERROR"
+
+# A conservative allowlist used when sanitizing identifiers bound for queries.
+_SAFE_IDENTIFIER_RE = re.compile(r"[^A-Za-z0-9_\-]")
+
+logger = logging.getLogger("order_service")
+
+
+# --------------------------------------------------------------------------- #
+# Configuration (R-019: externalized configuration)
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class ServiceConfig:
+    """Configuration container for the order service.
+
+    Attributes:
+        database_url: Connection string for the order database.
+        payment_api_key: Secret key used to authenticate with the payment API.
+        rate_limit_per_minute: Maximum number of write operations per minute.
+        max_items_per_order: Upper bound on distinct line items per order.
+    """
+
+    database_url: str = "sqlite:///orders.db"
+    payment_api_key: str = "test-key"
+    rate_limit_per_minute: int = 60
+    max_items_per_order: int = 100
+
+
+# A module-level default; callers may pass their own ServiceConfig instead.
+DEFAULT_CONFIG = ServiceConfig()
+
+
+# --------------------------------------------------------------------------- #
+# Domain exceptions (R-007: domain-specific exception classes)
+# --------------------------------------------------------------------------- #
+class OrderServiceError(Exception):
+    """Base class for all order-service errors.
+
+    Attributes:
+        code: Stable machine-readable error code.
+    """
+
+    code: str = ERROR_INTERNAL
+
+
+class ValidationError(OrderServiceError):
+    """Raised when input validation fails."""
+
+    code = ERROR_VALIDATION
+
+
+class PermissionDeniedError(OrderServiceError):
+    """Raised when the caller is not permitted to act on a resource."""
+
+    code = ERROR_PERMISSION
+
+
+class OrderNotFoundError(OrderServiceError):
+    """Raised when a requested order does not exist for the user."""
+
+    code = ERROR_NOT_FOUND
+
+
+class PaymentError(OrderServiceError):
+    """Raised when payment processing or refunding fails."""
+
+    code = ERROR_PAYMENT
+
+
+# --------------------------------------------------------------------------- #
+# Logging helper (R-016: correlation_id on every log entry)
+# --------------------------------------------------------------------------- #
+def _get_logger(correlation_id: str) -> logging.LoggerAdapter:
+    """Return a logger adapter that injects the correlation id.
+
+    Args:
+        correlation_id: Identifier used to correlate log lines for one request.
+
+    Returns:
+        A LoggerAdapter that prefixes every message with the correlation id.
+    """
+    return logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
+
+
+def _new_correlation_id() -> str:
+    """Generate a unique correlation id.
+
+    Returns:
+        A new hexadecimal correlation identifier.
+    """
+    return uuid.uuid4().hex
+
+
+def _now_iso() -> str:
+    """Return the current UTC time as an ISO-8601 string.
+
+    Returns:
+        The current timestamp in ISO-8601 format with timezone.
+    """
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _error_response(error: OrderServiceError) -> Dict[str, Any]:
+    """Build a structured error response (R-010).
+
+    Args:
+        error: The domain error to render.
+
+    Returns:
+        A dict with ``error_code``, ``message``, and ``timestamp`` keys.
+    """
+    return {
+        "error_code": error.code,
+        "message": str(error),
+        "timestamp": _now_iso(),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Input sanitation & validation (R-001..R-004)
+# --------------------------------------------------------------------------- #
+def _sanitize_identifier(value: str, field_name: str) -> str:
+    """Validate and sanitize an identifier destined for a query (R-003).
+
+    Args:
+        value: The raw identifier supplied by the caller.
+        field_name: Name of the field, used in error messages.
+
+    Returns:
+        The sanitized identifier safe for use in a parameterized query.
+
+    Raises:
+        ValidationError: If the value is not a non-empty string.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError(f"{field_name} must be a non-empty string")
+    return _SAFE_IDENTIFIER_RE.sub("", value.strip())
+
+
+def _validate_item(item: Dict[str, Any], index: int) -> Dict[str, Any]:
+    """Validate a single order line item (R-001, R-002, R-004).
+
+    Args:
+        item: A mapping with ``name``, ``quantity``, and ``unit_price``.
+        index: Position of the item in the list, for error messages.
+
+    Returns:
+        A normalized item dict with an HTML-escaped name.
+
+    Raises:
+        ValidationError: If any field is missing or has an invalid value.
+    """
+    if not isinstance(item, dict):
+        raise ValidationError(f"item[{index}] must be a dict")
+    name, quantity, unit_price = _extract_item_fields(item, index)
+    return {
+        "name": html.escape(name),
+        "quantity": quantity,
+        "unit_price": unit_price,
+    }
+
+
+def _extract_item_fields(item: Dict[str, Any], index: int) -> tuple:
+    """Extract and type-check the fields of a line item.
+
+    Args:
+        item: The raw item mapping.
+        index: Position of the item in the list, for error messages.
+
+    Returns:
+        A tuple of ``(name, quantity, unit_price)``.
+
+    Raises:
+        ValidationError: If a field is missing, mistyped, or negative.
+    """
+    name = item.get("name")
+    quantity = item.get("quantity")
+    unit_price = item.get("unit_price")
+    if not isinstance(name, str) or not name.strip():
+        raise ValidationError(f"item[{index}].name must be a non-empty string")
+    if not isinstance(quantity, int) or isinstance(quantity, bool):
+        raise ValidationError(f"item[{index}].quantity must be an int")
+    if quantity < MIN_QUANTITY:
+        raise ValidationError(f"item[{index}].quantity must be >= {MIN_QUANTITY}")
+    if not isinstance(unit_price, (int, float)) or isinstance(unit_price, bool):
+        raise ValidationError(f"item[{index}].unit_price must be numeric")
+    if unit_price < MIN_UNIT_PRICE:
+        raise ValidationError(f"item[{index}].unit_price must be >= {MIN_UNIT_PRICE}")
+    return name, quantity, float(unit_price)
+
+
+def _validate_items(items: List[Dict[str, Any]], config: ServiceConfig) -> List[Dict[str, Any]]:
+    """Validate the full list of order items (R-001).
+
+    Args:
+        items: The raw list of line items.
+        config: Service configuration providing item-count bounds.
+
+    Returns:
+        A list of normalized item dicts.
+
+    Raises:
+        ValidationError: If the list is empty, too large, or malformed.
+    """
+    if not isinstance(items, list) or not items:
+        raise ValidationError("items must be a non-empty list")
+    if len(items) > config.max_items_per_order:
+        raise ValidationError(f"items exceeds max of {config.max_items_per_order}")
+    return [_validate_item(item, i) for i, item in enumerate(items)]
+
+
+def _calculate_total(items: List[Dict[str, Any]]) -> float:
+    """Sum the line totals for the given items.
+
+    Args:
+        items: Normalized item dicts with ``quantity`` and ``unit_price``.
+
+    Returns:
+        The order total rounded to the configured number of decimals.
+    """
+    total = sum(item["quantity"] * item["unit_price"] for item in items)
+    return round(total, PRICE_ROUNDING_DECIMALS)
+
+
+# --------------------------------------------------------------------------- #
+# Gateways: persistence + payment (in-memory reference implementations)
+# --------------------------------------------------------------------------- #
+@dataclass
+class _OrderStore:
+    """A minimal in-memory order store standing in for a database."""
+
+    _orders: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
+    def save(self, order: Dict[str, Any]) -> None:
+        """Persist an order record.
+
+        Args:
+            order: The order record to store.
+        """
+        self._orders[order["order_id"]] = order
+
+    def get(self, order_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch an order by id.
+
+        Args:
+            order_id: The order identifier.
+
+        Returns:
+            The stored order, or ``None`` if not present.
+        """
+        return self._orders.get(order_id)
+
+
+# Module-level store and idempotency ledger (R-022).
+_STORE = _OrderStore()
+
+
+def _process_payment(token: str, amount: float, log: logging.LoggerAdapter) -> str:
+    """Charge the given amount using the payment token.
+
+    Args:
+        token: The payment token authorizing the charge.
+        amount: The amount to charge.
+        log: Correlation-aware logger.
+
+    Returns:
+        A payment transaction id.
+
+    Raises:
+        PaymentError: If the token is missing or the charge is rejected.
+    """
+    if not isinstance(token, str) or not token.strip():
+        raise PaymentError("payment_token must be a non-empty string")
+    log.info("Charging %.2f via payment gateway", amount)
+    return f"pay_{uuid.uuid4().hex}"
+
+
+def _issue_refund(payment_id: str, amount: float, log: logging.LoggerAdapter) -> str:
+    """Refund a previously captured payment.
+
+    Args:
+        payment_id: The original payment transaction id.
+        amount: The amount to refund.
+        log: Correlation-aware logger.
+
+    Returns:
+        A refund transaction id.
+
+    Raises:
+        PaymentError: If the refund is rejected by the gateway.
+    """
+    if not payment_id:
+        raise PaymentError("missing payment_id for refund")
+    log.info("Refunding %.2f for payment %s", amount, payment_id)
+    return f"{REFUND_ID_PREFIX}_{uuid.uuid4().hex}"
+
+
+# --------------------------------------------------------------------------- #
+# Authorization (R-020)
+# --------------------------------------------------------------------------- #
+def _authorize(user_id: str, order: Dict[str, Any]) -> None:
+    """Verify the user owns the order before a privileged action (R-020).
+
+    Args:
+        user_id: The acting user's id.
+        order: The order record being acted upon.
+
+    Raises:
+        PermissionDeniedError: If the user does not own the order.
+    """
+    if order.get("user_id") != user_id:
+        raise PermissionDeniedError("caller is not permitted to act on this order")
+
+
+# --------------------------------------------------------------------------- #
+# Public API
+# --------------------------------------------------------------------------- #
+def create_order(
+    user_id: str,
+    items: List[Dict[str, Any]],
+    payment_token: str,
+    config: ServiceConfig = DEFAULT_CONFIG,
+) -> Dict[str, Any]:
+    """Create a new order, charge payment, and return a confirmation.
+
+    Args:
+        user_id: The id of the user placing the order.
+        items: Line items, each with ``name``, ``quantity``, ``unit_price``.
+        payment_token: Token authorizing the charge.
+        config: Service configuration to use.
+
+    Returns:
+        An order confirmation dict, or a structured error response on failure.
+
+    Raises:
+        ValidationError: Propagated only internally; surfaced as a response.
+    """
+    correlation_id = _new_correlation_id()
+    log = _get_logger(correlation_id)
+    log.debug("Enter create_order user_id=%s items=%d", user_id, len(items or []))
+    try:
+        result = _create_order_impl(user_id, items, payment_token, config, log, correlation_id)
+        log.debug("Exit create_order -> %s", type(result).__name__)
+        return result
+    except OrderServiceError as exc:
+        log.error("create_order failed: %s", exc, exc_info=True)
+        return _error_response(exc)
+
+
+def _create_order_impl(
+    user_id: str,
+    items: List[Dict[str, Any]],
+    payment_token: str,
+    config: ServiceConfig,
+    log: logging.LoggerAdapter,
+    correlation_id: str,
+) -> Dict[str, Any]:
+    """Perform the create-order workflow (kept small per R-028).
+
+    Args:
+        user_id: The id of the user placing the order.
+        items: Raw line items to validate and price.
+        payment_token: Token authorizing the charge.
+        config: Service configuration to use.
+        log: Correlation-aware logger.
+        correlation_id: Identifier echoed into the confirmation.
+
+    Returns:
+        The order confirmation dict.
+
+    Raises:
+        ValidationError: If inputs are invalid.
+        PaymentError: If the charge cannot be processed.
+    """
+    safe_user = _sanitize_identifier(user_id, "user_id")
+    normalized = _validate_items(items, config)
+    total = _calculate_total(normalized)
+    payment_id = _process_payment(payment_token, total, log)
+    order = _build_order(safe_user, normalized, total, payment_id, correlation_id)
+    _STORE.save(order)
+    log.info("Order %s created for user %s total=%.2f", order["order_id"], safe_user, total)
+    return _confirmation(order)
+
+
+def _build_order(
+    user_id: str,
+    items: List[Dict[str, Any]],
+    total: float,
+    payment_id: str,
+    correlation_id: str,
+) -> Dict[str, Any]:
+    """Assemble the persistent order record.
+
+    Args:
+        user_id: Owning user's id.
+        items: Normalized line items.
+        total: Computed order total.
+        payment_id: Captured payment transaction id.
+        correlation_id: Request correlation id stored with the order.
+
+    Returns:
+        A fully populated order record dict.
+    """
+    return {
+        "order_id": f"{ORDER_ID_PREFIX}_{uuid.uuid4().hex}",
+        "user_id": user_id,
+        "items": items,
+        "total": total,
+        "payment_id": payment_id,
+        "status": STATUS_CREATED,
+        "correlation_id": correlation_id,
+        "created_at": _now_iso(),
+    }
+
+
+def _confirmation(order: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the client-facing confirmation for a created order.
+
+    Args:
+        order: The stored order record.
+
+    Returns:
+        A confirmation dict exposing only client-relevant fields.
+    """
+    return {
+        "order_id": order["order_id"],
+        "status": order["status"],
+        "total": order["total"],
+        "payment_id": order["payment_id"],
+        "timestamp": order["created_at"],
+        "correlation_id": order["correlation_id"],
+    }
+
+
+def cancel_order(
+    user_id: str,
+    order_id: str,
+    reason: str,
+    config: ServiceConfig = DEFAULT_CONFIG,
+) -> Dict[str, Any]:
+    """Cancel an existing order and issue a refund.
+
+    Args:
+        user_id: The id of the user cancelling the order.
+        order_id: The id of the order to cancel.
+        reason: Free-text cancellation reason (HTML-escaped before storage).
+        config: Service configuration to use.
+
+    Returns:
+        A cancellation confirmation dict, or a structured error response.
+    """
+    correlation_id = _new_correlation_id()
+    log = _get_logger(correlation_id)
+    log.debug("Enter cancel_order user_id=%s order_id=%s", user_id, order_id)
+    try:
+        result = _cancel_order_impl(user_id, order_id, reason, log)
+        log.debug("Exit cancel_order -> %s", type(result).__name__)
+        return result
+    except OrderServiceError as exc:
+        log.error("cancel_order failed: %s", exc, exc_info=True)
+        return _error_response(exc)
+
+
+def _cancel_order_impl(
+    user_id: str,
+    order_id: str,
+    reason: str,
+    log: logging.LoggerAdapter,
+) -> Dict[str, Any]:
+    """Perform the cancel-order workflow (kept small per R-028).
+
+    Args:
+        user_id: The cancelling user's id.
+        order_id: The order to cancel.
+        reason: Cancellation reason, escaped before storage.
+        log: Correlation-aware logger.
+
+    Returns:
+        The cancellation confirmation dict.
+
+    Raises:
+        OrderNotFoundError: If the order does not exist.
+        PermissionDeniedError: If the user does not own the order.
+        PaymentError: If the refund cannot be issued.
+    """
+    order = _load_owned_order(user_id, order_id)
+    if order["status"] == STATUS_CANCELLED:  # R-022: idempotency guard
+        log.info("Order %s already cancelled; returning prior result", order_id)
+        return order["cancellation"]
+    refund_id = _issue_refund(order.get("payment_id", ""), order["total"], log)
+    return _apply_cancellation(order, reason, refund_id, log)
+
+
+def _apply_cancellation(
+    order: Dict[str, Any],
+    reason: str,
+    refund_id: str,
+    log: logging.LoggerAdapter,
+) -> Dict[str, Any]:
+    """Mutate and persist the order as cancelled, returning confirmation.
+
+    Args:
+        order: The order record to update.
+        reason: Cancellation reason, escaped before storage.
+        refund_id: The issued refund transaction id.
+        log: Correlation-aware logger.
+
+    Returns:
+        The cancellation confirmation dict.
+    """
+    confirmation = {
+        "order_id": order["order_id"],
+        "status": STATUS_CANCELLED,
+        "refund_id": refund_id,
+        "reason": html.escape(reason or ""),
+        "timestamp": _now_iso(),
+    }
+    order["status"] = STATUS_CANCELLED
+    order["cancellation"] = confirmation
+    _STORE.save(order)
+    log.info("Order %s cancelled, refund %s issued", order["order_id"], refund_id)
+    return confirmation
+
+
+def get_order_status(
+    user_id: str,
+    order_id: str,
+    config: ServiceConfig = DEFAULT_CONFIG,
+) -> Dict[str, Any]:
+    """Retrieve the status and summary of an order.
+
+    Args:
+        user_id: The requesting user's id.
+        order_id: The order to look up.
+        config: Service configuration to use.
+
+    Returns:
+        An order status dict, or a structured error response on failure.
+    """
+    correlation_id = _new_correlation_id()
+    log = _get_logger(correlation_id)
+    log.debug("Enter get_order_status user_id=%s order_id=%s", user_id, order_id)
+    try:
+        order = _load_owned_order(user_id, order_id)
+        result = _status_view(order)
+        log.debug("Exit get_order_status -> %s", type(result).__name__)
+        return result
+    except OrderServiceError as exc:
+        log.error("get_order_status failed: %s", exc, exc_info=True)
+        return _error_response(exc)
+
+
+def _status_view(order: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the read-only status view of an order.
+
+    Args:
+        order: The stored order record.
+
+    Returns:
+        A dict exposing the order's status and summary fields.
+    """
+    return {
+        "order_id": order["order_id"],
+        "status": order["status"],
+        "total": order["total"],
+        "item_count": len(order["items"]),
+        "timestamp": _now_iso(),
+    }
+
+
+def _load_owned_order(user_id: str, order_id: str) -> Dict[str, Any]:
+    """Load an order and verify the user owns it.
+
+    Args:
+        user_id: The requesting user's id.
+        order_id: The order to load.
+
+    Returns:
+        The stored, ownership-verified order record.
+
+    Raises:
+        OrderNotFoundError: If no such order exists.
+        PermissionDeniedError: If the user does not own the order.
+    """
+    safe_user = _sanitize_identifier(user_id, "user_id")
+    safe_order = _sanitize_identifier(order_id, "order_id")
+    order = _STORE.get(safe_order)
+    if order is None:
+        raise OrderNotFoundError(f"order {safe_order} not found")
+    _authorize(safe_user, order)
+    return order
+```
+
+## `test_order_service.py`
+
+```python
+"""Unit tests for order_service."""
+
+import unittest
+
+import order_service as svc
+
+
+class CreateOrderTests(unittest.TestCase):
+    """Tests for create_order."""
+
+    def setUp(self) -> None:
+        self.items = [
+            {"name": "Widget", "quantity": 2, "unit_price": 10.0},
+            {"name": "Gadget", "quantity": 1, "unit_price": 5.5},
+        ]
+
+    def test_create_order_success(self) -> None:
+        result = svc.create_order("user-1", self.items, "tok_abc")
+        self.assertEqual(result["status"], svc.STATUS_CREATED)
+        self.assertAlmostEqual(result["total"], 25.5)
+        self.assertTrue(result["order_id"].startswith(svc.ORDER_ID_PREFIX))
+        self.assertIn("payment_id", result)
+        self.assertIn("correlation_id", result)
+
+    def test_negative_quantity_rejected(self) -> None:
+        bad = [{"name": "X", "quantity": -1, "unit_price": 1.0}]
+        result = svc.create_order("user-1", bad, "tok")
+        self.assertEqual(result["error_code"], svc.ERROR_VALIDATION)
+
+    def test_zero_quantity_rejected(self) -> None:
+        bad = [{"name": "X", "quantity": 0, "unit_price": 1.0}]
+        result = svc.create_order("user-1", bad, "tok")
+        self.assertEqual(result["error_code"], svc.ERROR_VALIDATION)
+
+    def test_empty_items_rejected(self) -> None:
+        result = svc.create_order("user-1", [], "tok")
+        self.assertEqual(result["error_code"], svc.ERROR_VALIDATION)
+
+    def test_bad_user_id_rejected(self) -> None:
+        result = svc.create_order("", self.items, "tok")
+        self.assertEqual(result["error_code"], svc.ERROR_VALIDATION)
+
+    def test_missing_payment_token_rejected(self) -> None:
+        result = svc.create_order("user-1", self.items, "")
+        self.assertEqual(result["error_code"], svc.ERROR_PAYMENT)
+
+    def test_non_numeric_price_rejected(self) -> None:
+        bad = [{"name": "X", "quantity": 1, "unit_price": "free"}]
+        result = svc.create_order("user-1", bad, "tok")
+        self.assertEqual(result["error_code"], svc.ERROR_VALIDATION)
+
+    def test_html_in_name_is_escaped(self) -> None:
+        items = [{"name": "<b>x</b>", "quantity": 1, "unit_price": 1.0}]
+        result = svc.create_order("user-1", items, "tok")
+        order = svc._STORE.get(result["order_id"])
+        self.assertEqual(order["items"][0]["name"], "&lt;b&gt;x&lt;/b&gt;")
+
+    def test_error_response_shape(self) -> None:
+        result = svc.create_order("user-1", [], "tok")
+        self.assertEqual(
+            set(result), {"error_code", "message", "timestamp"}
+        )
+
+
+class CancelOrderTests(unittest.TestCase):
+    """Tests for cancel_order."""
+
+    def setUp(self) -> None:
+        self.items = [{"name": "Widget", "quantity": 1, "unit_price": 9.0}]
+        self.order = svc.create_order("owner", self.items, "tok")
+
+    def test_cancel_success(self) -> None:
+        result = svc.cancel_order("owner", self.order["order_id"], "changed mind")
+        self.assertEqual(result["status"], svc.STATUS_CANCELLED)
+        self.assertTrue(result["refund_id"].startswith(svc.REFUND_ID_PREFIX))
+
+    def test_cancel_is_idempotent(self) -> None:
+        first = svc.cancel_order("owner", self.order["order_id"], "r")
+        second = svc.cancel_order("owner", self.order["order_id"], "r")
+        self.assertEqual(first["refund_id"], second["refund_id"])
+
+    def test_cancel_unknown_order(self) -> None:
+        result = svc.cancel_order("owner", "ord_missing", "r")
+        self.assertEqual(result["error_code"], svc.ERROR_NOT_FOUND)
+
+    def test_cancel_wrong_user_denied(self) -> None:
+        result = svc.cancel_order("intruder", self.order["order_id"], "r")
+        self.assertEqual(result["error_code"], svc.ERROR_PERMISSION)
+
+    def test_cancel_reason_escaped(self) -> None:
+        result = svc.cancel_order("owner", self.order["order_id"], "<i>no</i>")
+        self.assertEqual(result["reason"], "&lt;i&gt;no&lt;/i&gt;")
+
+
+class GetOrderStatusTests(unittest.TestCase):
+    """Tests for get_order_status."""
+
+    def setUp(self) -> None:
+        self.items = [{"name": "Widget", "quantity": 3, "unit_price": 2.0}]
+        self.order = svc.create_order("owner", self.items, "tok")
+
+    def test_status_success(self) -> None:
+        result = svc.get_order_status("owner", self.order["order_id"])
+        self.assertEqual(result["status"], svc.STATUS_CREATED)
+        self.assertEqual(result["item_count"], 1)
+        self.assertAlmostEqual(result["total"], 6.0)
+
+    def test_status_unknown_order(self) -> None:
+        result = svc.get_order_status("owner", "ord_nope")
+        self.assertEqual(result["error_code"], svc.ERROR_NOT_FOUND)
+
+    def test_status_wrong_user_denied(self) -> None:
+        result = svc.get_order_status("intruder", self.order["order_id"])
+        self.assertEqual(result["error_code"], svc.ERROR_PERMISSION)
+
+    def test_status_reflects_cancellation(self) -> None:
+        svc.cancel_order("owner", self.order["order_id"], "r")
+        result = svc.get_order_status("owner", self.order["order_id"])
+        self.assertEqual(result["status"], svc.STATUS_CANCELLED)
+
+
+class ConfigTests(unittest.TestCase):
+    """Tests for ServiceConfig."""
+
+    def test_defaults(self) -> None:
+        cfg = svc.ServiceConfig()
+        self.assertEqual(cfg.rate_limit_per_minute, 60)
+        self.assertTrue(cfg.database_url)
+        self.assertTrue(cfg.payment_api_key)
+
+    def test_max_items_enforced(self) -> None:
+        cfg = svc.ServiceConfig(max_items_per_order=1)
+        items = [
+            {"name": "a", "quantity": 1, "unit_price": 1.0},
+            {"name": "b", "quantity": 1, "unit_price": 1.0},
+        ]
+        result = svc.create_order("u", items, "tok", config=cfg)
+        self.assertEqual(result["error_code"], svc.ERROR_VALIDATION)
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+### How this maps to the 20 rules
+
+- **R-001/R-002** — `_extract_item_fields` type-checks every field and rejects `quantity < 1` (and non-numeric/negative prices).
+- **R-003** — `_sanitize_identifier` strips anything outside an allowlist before IDs touch the store/query layer.
+- **R-004** — item names and cancellation reasons pass through `html.escape`.
+- **R-007/R-008** — domain exception hierarchy (`ValidationError`, `PaymentError`, …); gateways raise these with context.
+- **R-009/R-010** — public functions catch `OrderServiceError`, log at ERROR with `exc_info=True`, and return `{error_code, message, timestamp}`.
+- **R-013/R-014/R-015/R-016** — DEBUG entry/exit logs, INFO on state changes, all via a `LoggerAdapter` carrying `correlation_id`.
+- **R-019** — `ServiceConfig` holds DB URL, payment key, and rate limit.
+- **R-020** — `_authorize` checks ownership before cancel/read.
+- **R-022** — `cancel_order` short-circuits if already cancelled, returning the prior result.
+- **R-025/R-026/R-027/R-028** — full type hints, Args/Returns/Raises docstrings, named constants, and each function kept small via helper decomposition.
+
+Two notes worth flagging honestly:
+- **R-021 (finally blocks)** — the reference store/payment gateways are in-memory and hold no closable resources, so there are no `finally` release blocks to add here. With a real DB connection or HTTP client, you'd wrap those in `try/finally`.
+- The store is module-level and persists across tests, which is why every test uses unique freshly-created orders rather than asserting on global counts. For a real service you'd inject the store/gateways rather than use module globals.
+
+Want me to retry the file writes (it needs write permission), add a `requirements.txt`/`pytest` setup, or swap the in-memory gateways for an injectable interface?

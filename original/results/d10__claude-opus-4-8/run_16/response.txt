@@ -1,0 +1,536 @@
+The file write needs permission, but since you asked me to output the complete file content, here it is directly. The module follows all 10 mandatory rules from CLAUDE.md.
+
+**`order_service.py`**
+
+```python
+"""Order management service.
+
+This module provides a small order-management service with creation,
+cancellation, and status-retrieval operations. It follows the mandatory
+agent rules: parameter validation, domain-specific exceptions with preserved
+error context, DEBUG-level entry/exit logging, externalized configuration,
+caller permission checks, full type hints, and documented public functions.
+"""
+
+from __future__ import annotations
+
+import logging
+import uuid
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Configuration (R-019: externalize all configuration values)
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class ServiceConfig:
+    """Configuration for the order service.
+
+    Attributes:
+        database_url: Connection string for the order datastore.
+        payment_api_key: API key used to authenticate with the payment gateway.
+        max_orders_per_minute: Rate limit for order creation per user.
+        max_items_per_order: Maximum number of distinct line items per order.
+        currency: ISO currency code used for monetary amounts.
+    """
+
+    database_url: str = "sqlite:///orders.db"
+    payment_api_key: str = "test-key"
+    max_orders_per_minute: int = 60
+    max_items_per_order: int = 100
+    currency: str = "USD"
+
+
+# ---------------------------------------------------------------------------
+# Domain-specific exceptions (R-007: no generic Exception)
+# ---------------------------------------------------------------------------
+class OrderServiceError(Exception):
+    """Base class for all order-service errors."""
+
+
+class ValidationError(OrderServiceError):
+    """Raised when input parameters fail validation."""
+
+
+class PermissionDeniedError(OrderServiceError):
+    """Raised when a caller lacks permission for a privileged operation."""
+
+
+class OrderNotFoundError(OrderServiceError):
+    """Raised when a referenced order does not exist."""
+
+
+class PaymentError(OrderServiceError):
+    """Raised when a payment or refund operation fails."""
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+# In-memory store standing in for the datastore referenced by config.database_url.
+_ORDERS: Dict[str, Dict[str, Any]] = {}
+
+
+def _summarize(value: Any, max_len: int = 80) -> str:
+    """Produce a short, log-safe summary of a parameter value.
+
+    Args:
+        value: The value to summarize.
+        max_len: Maximum length of the returned summary string.
+
+    Returns:
+        A truncated string representation suitable for DEBUG logging.
+    """
+    text = repr(value)
+    return text if len(text) <= max_len else text[: max_len - 3] + "..."
+
+
+def _require_non_empty_str(name: str, value: Any) -> str:
+    """Validate that a value is a non-empty string (R-001).
+
+    Args:
+        name: Parameter name, used in error messages.
+        value: Value to validate.
+
+    Returns:
+        The validated string.
+
+    Raises:
+        ValidationError: If the value is not a non-empty string.
+    """
+    if not isinstance(value, str):
+        raise ValidationError(f"{name} must be a str, got {type(value).__name__}")
+    if not value.strip():
+        raise ValidationError(f"{name} must not be empty")
+    return value
+
+
+def _default_permission_check(user_id: str, order: Optional[Dict[str, Any]]) -> bool:
+    """Default permission policy: a user may act only on their own orders.
+
+    Args:
+        user_id: The acting user's identifier.
+        order: The target order, or None for creation operations.
+
+    Returns:
+        True if the operation is permitted, False otherwise.
+    """
+    if order is None:
+        return True
+    return order.get("user_id") == user_id
+
+
+def _validate_items(items: Any, config: ServiceConfig) -> List[Dict[str, Any]]:
+    """Validate the items list and each line item (R-001, R-002).
+
+    Args:
+        items: The raw items argument supplied by the caller.
+        config: Active service configuration.
+
+    Returns:
+        The validated list of item dicts.
+
+    Raises:
+        ValidationError: If the list or any item is malformed, or a quantity
+            or unit price is negative.
+    """
+    if not isinstance(items, list):
+        raise ValidationError(f"items must be a list, got {type(items).__name__}")
+    if not items:
+        raise ValidationError("items must contain at least one entry")
+    if len(items) > config.max_items_per_order:
+        raise ValidationError(
+            f"items exceeds max_items_per_order ({config.max_items_per_order})"
+        )
+
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ValidationError(f"item[{index}] must be a dict")
+        _require_non_empty_str(f"item[{index}].name", item.get("name"))
+
+        quantity = item.get("quantity")
+        if not isinstance(quantity, int) or isinstance(quantity, bool):
+            raise ValidationError(f"item[{index}].quantity must be an int")
+        if quantity < 0:  # R-002: reject negative quantities
+            raise ValidationError(f"item[{index}].quantity must not be negative")
+
+        unit_price = item.get("unit_price")
+        if not isinstance(unit_price, (int, float)) or isinstance(unit_price, bool):
+            raise ValidationError(f"item[{index}].unit_price must be a number")
+        if unit_price < 0:
+            raise ValidationError(f"item[{index}].unit_price must not be negative")
+
+    return items
+
+
+def _calculate_total(items: List[Dict[str, Any]]) -> float:
+    """Sum the line totals for all items.
+
+    Args:
+        items: Validated list of item dicts.
+
+    Returns:
+        The order total as a float rounded to two decimal places.
+    """
+    total = sum(item["quantity"] * item["unit_price"] for item in items)
+    return round(float(total), 2)
+
+
+def _process_payment(payment_token: str, amount: float, config: ServiceConfig) -> str:
+    """Charge a payment using the configured gateway (stubbed).
+
+    Args:
+        payment_token: Tokenized payment instrument.
+        amount: Amount to charge.
+        config: Active service configuration (provides the API key).
+
+    Returns:
+        A payment transaction identifier.
+
+    Raises:
+        PaymentError: If the gateway rejects the charge.
+    """
+    try:
+        # Placeholder for a real gateway call authenticated with the API key.
+        if amount < 0:
+            raise ValueError("amount must not be negative")
+        return f"pay_{uuid.uuid4().hex[:16]}"
+    except ValueError as exc:  # R-008: preserve original error context
+        raise PaymentError(f"payment failed for token {payment_token!r}") from exc
+
+
+def _process_refund(payment_id: str, amount: float, config: ServiceConfig) -> str:
+    """Issue a refund against a prior payment (stubbed).
+
+    Args:
+        payment_id: The original payment transaction identifier.
+        amount: Amount to refund.
+        config: Active service configuration.
+
+    Returns:
+        A refund transaction identifier.
+
+    Raises:
+        PaymentError: If the gateway rejects the refund.
+    """
+    try:
+        if amount < 0:
+            raise ValueError("amount must not be negative")
+        return f"ref_{uuid.uuid4().hex[:16]}"
+    except ValueError as exc:
+        raise PaymentError(f"refund failed for payment {payment_id!r}") from exc
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+def create_order(
+    user_id: str,
+    items: List[Dict[str, Any]],
+    payment_token: str,
+    config: Optional[ServiceConfig] = None,
+    permission_check: Callable[[str, Optional[Dict[str, Any]]], bool] = _default_permission_check,
+) -> Dict[str, Any]:
+    """Create a new order, charge payment, and persist it.
+
+    Args:
+        user_id: Identifier of the user placing the order.
+        items: List of line items; each is a dict with ``name`` (str),
+            ``quantity`` (non-negative int), and ``unit_price`` (non-negative
+            number).
+        payment_token: Tokenized payment instrument to charge.
+        config: Optional service configuration; a default is used if omitted.
+        permission_check: Callable returning whether the caller may act.
+
+    Returns:
+        An order confirmation dict containing the order id, user id, items,
+        total, currency, payment id, and status.
+
+    Raises:
+        ValidationError: If any parameter fails validation.
+        PermissionDeniedError: If the caller lacks permission.
+        PaymentError: If the payment cannot be processed.
+    """
+    logger.debug(
+        "create_order entry: user_id=%s items=%s payment_token=%s",
+        _summarize(user_id),
+        _summarize(items),
+        _summarize(payment_token),
+    )  # R-013
+
+    config = config or ServiceConfig()
+    _require_non_empty_str("user_id", user_id)
+    _require_non_empty_str("payment_token", payment_token)
+    validated_items = _validate_items(items, config)
+
+    if not permission_check(user_id, None):  # R-020
+        raise PermissionDeniedError(f"user {user_id!r} may not create orders")
+
+    total = _calculate_total(validated_items)
+    payment_id = _process_payment(payment_token, total, config)
+
+    order_id = f"ord_{uuid.uuid4().hex}"
+    order: Dict[str, Any] = {
+        "order_id": order_id,
+        "user_id": user_id,
+        "items": validated_items,
+        "total": total,
+        "currency": config.currency,
+        "payment_id": payment_id,
+        "status": "confirmed",
+    }
+    _ORDERS[order_id] = order
+
+    confirmation = dict(order)
+    logger.debug("create_order exit: return type=%s", type(confirmation).__name__)  # R-014
+    return confirmation
+
+
+def cancel_order(
+    user_id: str,
+    order_id: str,
+    reason: str,
+    config: Optional[ServiceConfig] = None,
+    permission_check: Callable[[str, Optional[Dict[str, Any]]], bool] = _default_permission_check,
+) -> Dict[str, Any]:
+    """Cancel an existing order and issue a refund.
+
+    Args:
+        user_id: Identifier of the user requesting cancellation.
+        order_id: Identifier of the order to cancel.
+        reason: Free-text cancellation reason.
+        config: Optional service configuration; a default is used if omitted.
+        permission_check: Callable returning whether the caller may act.
+
+    Returns:
+        A cancellation confirmation dict with the order id, status, refund id,
+        and reason.
+
+    Raises:
+        ValidationError: If any parameter fails validation.
+        OrderNotFoundError: If the order does not exist.
+        PermissionDeniedError: If the caller lacks permission.
+        PaymentError: If the refund cannot be processed.
+    """
+    logger.debug(
+        "cancel_order entry: user_id=%s order_id=%s reason=%s",
+        _summarize(user_id),
+        _summarize(order_id),
+        _summarize(reason),
+    )  # R-013
+
+    config = config or ServiceConfig()
+    _require_non_empty_str("user_id", user_id)
+    _require_non_empty_str("order_id", order_id)
+    _require_non_empty_str("reason", reason)
+
+    order = _ORDERS.get(order_id)
+    if order is None:
+        raise OrderNotFoundError(f"order {order_id!r} not found")
+    if not permission_check(user_id, order):  # R-020
+        raise PermissionDeniedError(
+            f"user {user_id!r} may not cancel order {order_id!r}"
+        )
+    if order["status"] == "cancelled":
+        raise ValidationError(f"order {order_id!r} is already cancelled")
+
+    refund_id = _process_refund(order["payment_id"], order["total"], config)
+    order["status"] = "cancelled"
+    order["cancellation_reason"] = reason
+    order["refund_id"] = refund_id
+
+    confirmation: Dict[str, Any] = {
+        "order_id": order_id,
+        "status": "cancelled",
+        "refund_id": refund_id,
+        "reason": reason,
+    }
+    logger.debug("cancel_order exit: return type=%s", type(confirmation).__name__)  # R-014
+    return confirmation
+
+
+def get_order_status(
+    user_id: str,
+    order_id: str,
+    config: Optional[ServiceConfig] = None,
+    permission_check: Callable[[str, Optional[Dict[str, Any]]], bool] = _default_permission_check,
+) -> Dict[str, Any]:
+    """Retrieve the status and summary of an existing order.
+
+    Args:
+        user_id: Identifier of the user requesting the status.
+        order_id: Identifier of the order to inspect.
+        config: Optional service configuration; a default is used if omitted.
+        permission_check: Callable returning whether the caller may act.
+
+    Returns:
+        An order status dict with the order id, user id, status, total, and
+        currency.
+
+    Raises:
+        ValidationError: If any parameter fails validation.
+        OrderNotFoundError: If the order does not exist.
+        PermissionDeniedError: If the caller lacks permission.
+    """
+    logger.debug(
+        "get_order_status entry: user_id=%s order_id=%s",
+        _summarize(user_id),
+        _summarize(order_id),
+    )  # R-013
+
+    config = config or ServiceConfig()
+    _require_non_empty_str("user_id", user_id)
+    _require_non_empty_str("order_id", order_id)
+
+    order = _ORDERS.get(order_id)
+    if order is None:
+        raise OrderNotFoundError(f"order {order_id!r} not found")
+    if not permission_check(user_id, order):  # R-020
+        raise PermissionDeniedError(
+            f"user {user_id!r} may not view order {order_id!r}"
+        )
+
+    status: Dict[str, Any] = {
+        "order_id": order["order_id"],
+        "user_id": order["user_id"],
+        "status": order["status"],
+        "total": order["total"],
+        "currency": order["currency"],
+    }
+    logger.debug("get_order_status exit: return type=%s", type(status).__name__)  # R-014
+    return status
+```
+
+**`test_order_service.py`**
+
+```python
+"""Unit tests for order_service."""
+
+import unittest
+
+import order_service as svc
+from order_service import (
+    OrderNotFoundError,
+    PermissionDeniedError,
+    ServiceConfig,
+    ValidationError,
+)
+
+
+def _items():
+    return [
+        {"name": "widget", "quantity": 2, "unit_price": 9.99},
+        {"name": "gadget", "quantity": 1, "unit_price": 5.00},
+    ]
+
+
+class CreateOrderTest(unittest.TestCase):
+    def setUp(self):
+        svc._ORDERS.clear()
+
+    def test_create_order_success(self):
+        result = svc.create_order("u1", _items(), "tok_123")
+        self.assertEqual(result["status"], "confirmed")
+        self.assertEqual(result["user_id"], "u1")
+        self.assertEqual(result["total"], 24.98)
+        self.assertTrue(result["order_id"].startswith("ord_"))
+        self.assertTrue(result["payment_id"].startswith("pay_"))
+
+    def test_uses_config_currency(self):
+        cfg = ServiceConfig(currency="EUR")
+        result = svc.create_order("u1", _items(), "tok", config=cfg)
+        self.assertEqual(result["currency"], "EUR")
+
+    def test_rejects_negative_quantity(self):  # R-002
+        bad = [{"name": "x", "quantity": -1, "unit_price": 1.0}]
+        with self.assertRaises(ValidationError):
+            svc.create_order("u1", bad, "tok")
+
+    def test_rejects_empty_items(self):
+        with self.assertRaises(ValidationError):
+            svc.create_order("u1", [], "tok")
+
+    def test_rejects_bad_user_id_type(self):  # R-001
+        with self.assertRaises(ValidationError):
+            svc.create_order(123, _items(), "tok")
+
+    def test_rejects_empty_payment_token(self):
+        with self.assertRaises(ValidationError):
+            svc.create_order("u1", _items(), "  ")
+
+    def test_permission_denied(self):  # R-020
+        with self.assertRaises(PermissionDeniedError):
+            svc.create_order("u1", _items(), "tok", permission_check=lambda u, o: False)
+
+
+class CancelOrderTest(unittest.TestCase):
+    def setUp(self):
+        svc._ORDERS.clear()
+        self.order = svc.create_order("u1", _items(), "tok")
+
+    def test_cancel_success(self):
+        result = svc.cancel_order("u1", self.order["order_id"], "changed mind")
+        self.assertEqual(result["status"], "cancelled")
+        self.assertEqual(result["reason"], "changed mind")
+        self.assertTrue(result["refund_id"].startswith("ref_"))
+
+    def test_cancel_missing_order(self):
+        with self.assertRaises(OrderNotFoundError):
+            svc.cancel_order("u1", "ord_missing", "x")
+
+    def test_cancel_other_users_order_denied(self):
+        with self.assertRaises(PermissionDeniedError):
+            svc.cancel_order("u2", self.order["order_id"], "x")
+
+    def test_double_cancel_rejected(self):
+        oid = self.order["order_id"]
+        svc.cancel_order("u1", oid, "first")
+        with self.assertRaises(ValidationError):
+            svc.cancel_order("u1", oid, "second")
+
+    def test_cancel_requires_reason(self):
+        with self.assertRaises(ValidationError):
+            svc.cancel_order("u1", self.order["order_id"], "")
+
+
+class GetOrderStatusTest(unittest.TestCase):
+    def setUp(self):
+        svc._ORDERS.clear()
+        self.order = svc.create_order("u1", _items(), "tok")
+
+    def test_status_success(self):
+        result = svc.get_order_status("u1", self.order["order_id"])
+        self.assertEqual(result["status"], "confirmed")
+        self.assertEqual(result["total"], 24.98)
+        self.assertEqual(result["user_id"], "u1")
+
+    def test_status_missing_order(self):
+        with self.assertRaises(OrderNotFoundError):
+            svc.get_order_status("u1", "ord_missing")
+
+    def test_status_permission_denied(self):
+        with self.assertRaises(PermissionDeniedError):
+            svc.get_order_status("u2", self.order["order_id"])
+
+    def test_status_reflects_cancellation(self):
+        oid = self.order["order_id"]
+        svc.cancel_order("u1", oid, "x")
+        self.assertEqual(svc.get_order_status("u1", oid)["status"], "cancelled")
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+How the 10 mandatory rules map to the code:
+
+- **R-001 / R-002** — `_require_non_empty_str` and `_validate_items` type-check every parameter and reject negative quantities (and negative prices).
+- **R-007 / R-008** — domain exceptions (`ValidationError`, `PaymentError`, etc.) instead of generic `Exception`; payment/refund re-raises use `raise ... from exc`.
+- **R-013 / R-014** — each public function logs entry (param summary) and exit (return type) at DEBUG.
+- **R-019 / R-020** — `ServiceConfig` holds DB URL, payment API key, and rate/size limits; every operation runs a `permission_check`.
+- **R-025 / R-026** — full type hints and Args/Returns/Raises docstrings on all public functions.
+
+If you'd like, I can grant-and-write these to disk — just approve the write and I'll save both files.

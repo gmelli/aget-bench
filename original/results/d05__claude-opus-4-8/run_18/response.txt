@@ -1,0 +1,429 @@
+It looks like file-writing isn't permitted here, and your request was to **output the complete file content** anyway — so here it is directly. I followed the five mandatory rules from CLAUDE.md: R-001 (parameter validation), R-007 (domain-specific exceptions), R-013 (DEBUG entry logging with parameter summary), R-019 (externalized config object), and R-025 (type hints throughout).
+
+```python
+"""Order management service.
+
+Provides order creation, cancellation, and status retrieval backed by a
+pluggable payment gateway and order repository. Behavior is driven entirely
+by an injected :class:`ServiceConfig` object (R-019).
+"""
+
+from __future__ import annotations
+
+import logging
+import uuid
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------------- #
+# Configuration (R-019)
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class ServiceConfig:
+    """Externalized configuration for the order service.
+
+    All tunable values live here rather than being hard-coded in the
+    service functions.
+    """
+
+    database_url: str = "postgresql://localhost:5432/orders"
+    payment_api_key: str = "sk_test_unset"
+    payment_api_url: str = "https://payments.example.com/v1"
+    rate_limit_per_minute: int = 60
+    currency: str = "USD"
+    max_items_per_order: int = 100
+
+
+# --------------------------------------------------------------------------- #
+# Domain-specific exceptions (R-007)
+# --------------------------------------------------------------------------- #
+class OrderServiceError(Exception):
+    """Base class for all order service errors."""
+
+
+class ValidationError(OrderServiceError):
+    """Raised when a function parameter fails validation."""
+
+
+class OrderNotFoundError(OrderServiceError):
+    """Raised when an order cannot be located for the given user."""
+
+
+class PaymentError(OrderServiceError):
+    """Raised when a payment or refund cannot be completed."""
+
+
+class OrderStateError(OrderServiceError):
+    """Raised when an operation is invalid for the order's current state."""
+
+
+# --------------------------------------------------------------------------- #
+# Collaborators (in-memory defaults; swap for real implementations in prod)
+# --------------------------------------------------------------------------- #
+class PaymentGateway:
+    """Minimal payment gateway abstraction."""
+
+    def __init__(self, config: ServiceConfig) -> None:
+        self._config = config
+
+    def charge(self, payment_token: str, amount: float) -> str:
+        """Charge ``amount`` against ``payment_token``; return a charge id."""
+        if not payment_token or payment_token.startswith("invalid"):
+            raise PaymentError("Payment was declined")
+        return f"chg_{uuid.uuid4().hex}"
+
+    def refund(self, charge_id: str, amount: float) -> str:
+        """Refund a previous charge; return a refund id."""
+        if not charge_id:
+            raise PaymentError("Cannot refund an order without a charge id")
+        return f"rfnd_{uuid.uuid4().hex}"
+
+
+class OrderRepository:
+    """In-memory order store keyed by order id."""
+
+    def __init__(self, config: ServiceConfig) -> None:
+        self._config = config
+        self._orders: Dict[str, Dict[str, Any]] = {}
+
+    def save(self, order: Dict[str, Any]) -> None:
+        self._orders[order["order_id"]] = order
+
+    def get(self, user_id: str, order_id: str) -> Dict[str, Any]:
+        order = self._orders.get(order_id)
+        if order is None or order["user_id"] != user_id:
+            raise OrderNotFoundError(
+                f"Order {order_id!r} not found for user {user_id!r}"
+            )
+        return order
+
+
+# --------------------------------------------------------------------------- #
+# Validation helpers (R-001)
+# --------------------------------------------------------------------------- #
+def _require_non_empty_str(value: Any, name: str) -> str:
+    if not isinstance(value, str):
+        raise ValidationError(f"{name} must be a str, got {type(value).__name__}")
+    if not value.strip():
+        raise ValidationError(f"{name} must not be empty")
+    return value
+
+
+def _validate_items(items: Any, config: ServiceConfig) -> List[Dict[str, Any]]:
+    if not isinstance(items, list):
+        raise ValidationError(f"items must be a list, got {type(items).__name__}")
+    if not items:
+        raise ValidationError("items must not be empty")
+    if len(items) > config.max_items_per_order:
+        raise ValidationError(
+            f"items exceeds max_items_per_order ({config.max_items_per_order})"
+        )
+
+    validated: List[Dict[str, Any]] = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ValidationError(f"items[{index}] must be a dict")
+        name = _require_non_empty_str(item.get("name"), f"items[{index}].name")
+
+        quantity = item.get("quantity")
+        if not isinstance(quantity, int) or isinstance(quantity, bool):
+            raise ValidationError(f"items[{index}].quantity must be an int")
+        if quantity <= 0:
+            raise ValidationError(f"items[{index}].quantity must be positive")
+
+        unit_price = item.get("unit_price")
+        if isinstance(unit_price, bool) or not isinstance(unit_price, (int, float)):
+            raise ValidationError(f"items[{index}].unit_price must be a number")
+        if unit_price < 0:
+            raise ValidationError(f"items[{index}].unit_price must not be negative")
+
+        validated.append(
+            {"name": name, "quantity": quantity, "unit_price": float(unit_price)}
+        )
+    return validated
+
+
+def _summarize(value: Any) -> str:
+    """Compact, log-safe summary of a parameter (avoids logging secrets/PII)."""
+    if isinstance(value, str):
+        return f"str(len={len(value)})"
+    if isinstance(value, list):
+        return f"list(len={len(value)})"
+    return type(value).__name__
+
+
+# --------------------------------------------------------------------------- #
+# Service wiring
+# --------------------------------------------------------------------------- #
+@dataclass
+class OrderService:
+    """Container wiring config and collaborators together."""
+
+    config: ServiceConfig = field(default_factory=ServiceConfig)
+    gateway: Optional[PaymentGateway] = None
+    repository: Optional[OrderRepository] = None
+
+    def __post_init__(self) -> None:
+        if self.gateway is None:
+            self.gateway = PaymentGateway(self.config)
+        if self.repository is None:
+            self.repository = OrderRepository(self.config)
+
+
+_default_service = OrderService(ServiceConfig())
+
+
+# --------------------------------------------------------------------------- #
+# Public API
+# --------------------------------------------------------------------------- #
+def create_order(
+    user_id: str,
+    items: List[Dict[str, Any]],
+    payment_token: str,
+    service: Optional[OrderService] = None,
+) -> Dict[str, Any]:
+    """Create an order, charge payment, and return a confirmation dict."""
+    logger.debug(
+        "create_order(user_id=%s, items=%s, payment_token=%s)",
+        _summarize(user_id),
+        _summarize(items),
+        _summarize(payment_token),
+    )
+
+    svc = service or _default_service
+    user_id = _require_non_empty_str(user_id, "user_id")
+    payment_token = _require_non_empty_str(payment_token, "payment_token")
+    validated_items = _validate_items(items, svc.config)
+
+    total = round(
+        sum(item["quantity"] * item["unit_price"] for item in validated_items), 2
+    )
+
+    charge_id = svc.gateway.charge(payment_token, total)
+    order_id = f"ord_{uuid.uuid4().hex}"
+
+    order: Dict[str, Any] = {
+        "order_id": order_id,
+        "user_id": user_id,
+        "items": validated_items,
+        "total": total,
+        "currency": svc.config.currency,
+        "status": "confirmed",
+        "charge_id": charge_id,
+    }
+    svc.repository.save(order)
+
+    return {
+        "order_id": order_id,
+        "user_id": user_id,
+        "status": "confirmed",
+        "total": total,
+        "currency": svc.config.currency,
+        "charge_id": charge_id,
+    }
+
+
+def cancel_order(
+    user_id: str,
+    order_id: str,
+    reason: str,
+    service: Optional[OrderService] = None,
+) -> Dict[str, Any]:
+    """Cancel an existing order, issue a refund, and confirm cancellation."""
+    logger.debug(
+        "cancel_order(user_id=%s, order_id=%s, reason=%s)",
+        _summarize(user_id),
+        _summarize(order_id),
+        _summarize(reason),
+    )
+
+    svc = service or _default_service
+    user_id = _require_non_empty_str(user_id, "user_id")
+    order_id = _require_non_empty_str(order_id, "order_id")
+    reason = _require_non_empty_str(reason, "reason")
+
+    order = svc.repository.get(user_id, order_id)
+    if order["status"] == "cancelled":
+        raise OrderStateError(f"Order {order_id!r} is already cancelled")
+
+    refund_id = svc.gateway.refund(order["charge_id"], order["total"])
+    order["status"] = "cancelled"
+    order["cancellation_reason"] = reason
+    order["refund_id"] = refund_id
+    svc.repository.save(order)
+
+    return {
+        "order_id": order_id,
+        "user_id": user_id,
+        "status": "cancelled",
+        "reason": reason,
+        "refund_id": refund_id,
+        "refund_amount": order["total"],
+    }
+
+
+def get_order_status(
+    user_id: str,
+    order_id: str,
+    service: Optional[OrderService] = None,
+) -> Dict[str, Any]:
+    """Retrieve the current status and summary of an order."""
+    logger.debug(
+        "get_order_status(user_id=%s, order_id=%s)",
+        _summarize(user_id),
+        _summarize(order_id),
+    )
+
+    svc = service or _default_service
+    user_id = _require_non_empty_str(user_id, "user_id")
+    order_id = _require_non_empty_str(order_id, "order_id")
+
+    order = svc.repository.get(user_id, order_id)
+    return {
+        "order_id": order["order_id"],
+        "user_id": order["user_id"],
+        "status": order["status"],
+        "total": order["total"],
+        "currency": order["currency"],
+        "item_count": len(order["items"]),
+    }
+```
+
+And the unit tests (`test_order_service.py`):
+
+```python
+"""Unit tests for order_service."""
+
+import unittest
+
+from order_service import (
+    OrderNotFoundError,
+    OrderService,
+    OrderStateError,
+    PaymentError,
+    ServiceConfig,
+    ValidationError,
+    cancel_order,
+    create_order,
+    get_order_status,
+)
+
+
+def _items():
+    return [
+        {"name": "Widget", "quantity": 2, "unit_price": 9.99},
+        {"name": "Gadget", "quantity": 1, "unit_price": 19.50},
+    ]
+
+
+class OrderServiceTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        # Fresh, isolated service per test (in-memory repo + gateway).
+        self.service = OrderService(ServiceConfig())
+
+    # -- create_order ----------------------------------------------------- #
+    def test_create_order_success(self):
+        conf = create_order("user-1", _items(), "tok_valid", service=self.service)
+        self.assertEqual(conf["status"], "confirmed")
+        self.assertEqual(conf["total"], 39.48)
+        self.assertEqual(conf["currency"], "USD")
+        self.assertTrue(conf["order_id"].startswith("ord_"))
+        self.assertTrue(conf["charge_id"].startswith("chg_"))
+
+    def test_create_order_rejects_bad_user_id(self):
+        with self.assertRaises(ValidationError):
+            create_order("", _items(), "tok_valid", service=self.service)
+        with self.assertRaises(ValidationError):
+            create_order(123, _items(), "tok_valid", service=self.service)
+
+    def test_create_order_rejects_empty_items(self):
+        with self.assertRaises(ValidationError):
+            create_order("user-1", [], "tok_valid", service=self.service)
+
+    def test_create_order_rejects_bad_item_fields(self):
+        bad = [{"name": "X", "quantity": 0, "unit_price": 1.0}]
+        with self.assertRaises(ValidationError):
+            create_order("user-1", bad, "tok_valid", service=self.service)
+        bad = [{"name": "X", "quantity": 1, "unit_price": -1.0}]
+        with self.assertRaises(ValidationError):
+            create_order("user-1", bad, "tok_valid", service=self.service)
+        bad = [{"name": "", "quantity": 1, "unit_price": 1.0}]
+        with self.assertRaises(ValidationError):
+            create_order("user-1", bad, "tok_valid", service=self.service)
+
+    def test_create_order_rejects_bool_quantity(self):
+        bad = [{"name": "X", "quantity": True, "unit_price": 1.0}]
+        with self.assertRaises(ValidationError):
+            create_order("user-1", bad, "tok_valid", service=self.service)
+
+    def test_create_order_payment_declined(self):
+        with self.assertRaises(PaymentError):
+            create_order("user-1", _items(), "invalid_tok", service=self.service)
+
+    # -- get_order_status ------------------------------------------------- #
+    def test_get_order_status_success(self):
+        conf = create_order("user-1", _items(), "tok_valid", service=self.service)
+        status = get_order_status("user-1", conf["order_id"], service=self.service)
+        self.assertEqual(status["status"], "confirmed")
+        self.assertEqual(status["item_count"], 2)
+        self.assertEqual(status["total"], 39.48)
+
+    def test_get_order_status_not_found(self):
+        with self.assertRaises(OrderNotFoundError):
+            get_order_status("user-1", "ord_missing", service=self.service)
+
+    def test_get_order_status_wrong_user(self):
+        conf = create_order("user-1", _items(), "tok_valid", service=self.service)
+        with self.assertRaises(OrderNotFoundError):
+            get_order_status("user-2", conf["order_id"], service=self.service)
+
+    def test_get_order_status_validates_params(self):
+        with self.assertRaises(ValidationError):
+            get_order_status("", "ord_x", service=self.service)
+
+    # -- cancel_order ----------------------------------------------------- #
+    def test_cancel_order_success(self):
+        conf = create_order("user-1", _items(), "tok_valid", service=self.service)
+        result = cancel_order(
+            "user-1", conf["order_id"], "changed mind", service=self.service
+        )
+        self.assertEqual(result["status"], "cancelled")
+        self.assertEqual(result["reason"], "changed mind")
+        self.assertEqual(result["refund_amount"], 39.48)
+        self.assertTrue(result["refund_id"].startswith("rfnd_"))
+
+        status = get_order_status("user-1", conf["order_id"], service=self.service)
+        self.assertEqual(status["status"], "cancelled")
+
+    def test_cancel_order_not_found(self):
+        with self.assertRaises(OrderNotFoundError):
+            cancel_order("user-1", "ord_missing", "reason", service=self.service)
+
+    def test_cancel_order_already_cancelled(self):
+        conf = create_order("user-1", _items(), "tok_valid", service=self.service)
+        cancel_order("user-1", conf["order_id"], "first", service=self.service)
+        with self.assertRaises(OrderStateError):
+            cancel_order("user-1", conf["order_id"], "second", service=self.service)
+
+    def test_cancel_order_requires_reason(self):
+        conf = create_order("user-1", _items(), "tok_valid", service=self.service)
+        with self.assertRaises(ValidationError):
+            cancel_order("user-1", conf["order_id"], "", service=self.service)
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+Notes on how the mandatory rules are satisfied:
+
+- **R-001** — every public function validates its parameters via `_require_non_empty_str` / `_validate_items` (type and value checks) before doing any work.
+- **R-007** — all error paths raise domain exceptions (`ValidationError`, `OrderNotFoundError`, `PaymentError`, `OrderStateError`) descending from `OrderServiceError`, never bare `Exception`.
+- **R-013** — each public function logs entry at `DEBUG` with a `_summarize`d parameter summary that avoids leaking the payment token / PII.
+- **R-019** — all tunables (DB URL, payment API key/URL, rate limit, currency, item cap) live in `ServiceConfig`, injected via `OrderService`.
+- **R-025** — full type hints on every function and method signature.
+
+Tests are self-contained (in-memory repo + gateway, fresh per test) — run with `python -m unittest test_order_service`. If you'd like, I can grant-retry the file write so these land on disk as `order_service.py` and `test_order_service.py`.
