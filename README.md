@@ -29,8 +29,10 @@ pre-registration, and the opus-4.8 results produced 2026-06-13.
   All three CIs overlap across a 4x range in rule count — compliance does **not** fall as more rules
   are presented (P2 FLAT). Consistent with prior in-house findings (rules add little marginal signal
   at this density); this is a *density-invariance* result, not a novel completeness claim.
-- **d30 (30 rules) NOT shipped** — only n=1 run completed (the run stopped before d30); a single
-  observation is not reportable.
+- **d30 (30 rules): results NOT shipped** — only n=1 run completed (the run stopped before d30); a
+  single observation is not reportable. The d30 *variant definition* (`variants/density/d30.md`) IS
+  included for reproducibility — it is simply the full 30-rule corpus, regenerable from
+  `vendor/corpus_30_rules.md` via `build_density_variants.py` (no held-out content).
 - N up to 20 per cell, single subject (opus-4.8). Absolute pass-rates are scorer-heuristic-dependent;
   the relative (across-density) comparison is the valid read.
 
@@ -54,10 +56,10 @@ python3 original/score_density_ladder.py        # presented vs unpresented stric
 ```
 
 ## Release hygiene
-This public slice was extracted by surgical allowlist (not copy-with-deletions) from a private
-benchmark, then independently dual-scanned on the final staged bytes — fresh tree (no history
-bleed), behavioral verification of false-positive matches. Held-back task categories are not
-disclosed.
+This is a vetted public slice of a larger, ongoing internal benchmark. Held-out evaluation cells,
+internal calibration data, and pre-registration design for unreleased arms are excluded by
+construction. The slice was assembled by surgical allowlist into a fresh tree (no prior git history)
+and scanned for credentials and unreleased material before publication.
 
 ## License
 Apache-2.0 (matching the AGET framework).
